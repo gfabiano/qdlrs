@@ -345,6 +345,7 @@ dependencies = [
 name = "qdl"
 version = "0.1.0"
 dependencies = [
+ "android-sparse-image",
  "anstream",
  "anyhow",
  "bincode",
@@ -362,7 +363,6 @@ dependencies = [
 name = "qdl-rs"
 version = "0.1.0"
 dependencies = [
- "android-sparse-image",
  "anyhow",
  "clap",
  "clap-num",
