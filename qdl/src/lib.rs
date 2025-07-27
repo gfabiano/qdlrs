@@ -12,6 +12,7 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::str::{self, FromStr};
+use std::vec;
 use types::FirehoseResetMode;
 use types::FirehoseStatus;
 use types::FirehoseStorageType;
@@ -21,7 +22,7 @@ use types::QdlReadWrite;
 use usb::setup_usb_device;
 
 use android_sparse_image::{
-    CHUNK_HEADER_BYTES_LEN, ChunkHeader, FileHeader, FileHeaderBytes, split::split_image,
+    CHUNK_HEADER_BYTES_LEN, ChunkHeader, ChunkType, FileHeader, FileHeaderBytes
 };
 
 use anyhow::bail;
@@ -442,26 +443,61 @@ pub fn firehose_program_storage_sparse<T: Read + Write + QdlChan, Q: Read + Seek
     start_sector: &str,
     data_sector_offset: u32,
 ) -> anyhow::Result<()> {
-    let mut sectors_left = num_sectors;
+    struct FlashGroup {
+        start_sector: usize,
+        data_offset: u64,
+        expanded_size: usize,
+        chunks: Vec<ChunkHeader>,
+    }
+
+    let mut flash_groups = vec![];
+
     let mut header_bytes = FileHeaderBytes::default();
     data.read_exact(&mut header_bytes)?;
-    let splits = match FileHeader::from_bytes(&header_bytes) {
-        Ok(header) => {
+    let header = FileHeader::from_bytes(&header_bytes);
+    match header {
+        Ok(ref header) => {
             println!("Preparing to flash android sparse image");
-            let mut chunks = vec![];
+            let mut flash_group_chunks = vec![];
+            let mut flash_group_size: usize = 0;
+            let mut flash_group_offset: u64 = 0;
+            let mut flash_group_start_sector = start_sector.parse::<usize>().unwrap();
+
             for _ in 0..header.chunks {
                 let mut chunk_bytes = [0; CHUNK_HEADER_BYTES_LEN];
                 data.read_exact(&mut chunk_bytes)?;
                 let chunk = ChunkHeader::from_bytes(&chunk_bytes)?;
+                let data_size = chunk.data_size();
+                let out_size = chunk.out_size(header);
 
-                data.seek(SeekFrom::Current(chunk.data_size() as i64))?;
-                chunks.push(chunk);
+                if chunk.chunk_type == ChunkType::Raw || chunk.chunk_type == ChunkType::Fill {
+                    if flash_group_chunks.is_empty() {
+                        // means is starting a new flash group
+                        flash_group_size = out_size;
+                        flash_group_offset = data.stream_position()?;
+                    } else {
+                        flash_group_size += out_size;
+                    }
+                    flash_group_chunks.push(chunk);
+                } else if !flash_group_chunks.is_empty() {
+                    let current_flash_group = FlashGroup {
+                        start_sector: flash_group_start_sector,
+                        data_offset: flash_group_offset,
+                        expanded_size: flash_group_size,
+                        chunks: flash_group_chunks,
+                    };
+                    flash_groups.push(current_flash_group);
+
+                    // reinitialize next flash group
+                    flash_group_chunks = vec![];
+                    flash_group_size = 0;
+                    flash_group_offset = 0;
+                }
+
+                flash_group_start_sector += out_size / channel.fh_config().storage_sector_size;
+
+                data.seek(SeekFrom::Current(data_size as i64))?;
             }
-            split_image(
-                &header,
-                &chunks,
-                channel.fh_config().send_buffer_size as u32,
-            )?
         }
         Err(android_sparse_image::ParseError::UnknownMagic) => {
             // Sparse attribute shall be wrong, fallback to raw programming
@@ -477,29 +513,26 @@ pub fn firehose_program_storage_sparse<T: Read + Write + QdlChan, Q: Read + Seek
                 phys_part_idx,
                 start_sector,
             )?;
-
-            vec![]
+            return Ok(());
         }
         Err(e) => {
             bail!("Unable to parse sparse image: {e}")
         }
     };
 
-    if !splits.is_empty() {
+    let block_size = header?.block_size;
+    for flash_group in flash_groups {
+        let mut sectors_left = flash_group.expanded_size / channel.fh_config().storage_sector_size;
         let mut xml = firehose_xml_setup(
-            "program",
+            "getsha256digest",
             &[
                 (
                     "SECTOR_SIZE_IN_BYTES",
                     &channel.fh_config().storage_sector_size.to_string(),
                 ),
-                ("num_partition_sectors", &num_sectors.to_string()),
+                ("num_partition_sectors", &sectors_left.to_string()),
                 ("physical_partition_number", &phys_part_idx.to_string()),
-                ("start_sector", start_sector),
-                (
-                    "read_back_verify",
-                    &(channel.fh_config().read_back_verify as u32).to_string(),
-                ),
+                ("start_sector", &flash_group.start_sector.to_string()),
             ],
         )?;
 
@@ -515,44 +548,17 @@ pub fn firehose_program_storage_sparse<T: Read + Write + QdlChan, Q: Read + Seek
         pb.message(&format!("Sending partition {label}: "));
         pb.set_units(Units::Bytes);
 
-        for (i, split) in splits.iter().enumerate() {
+        // Go to the start of chunks
+        let _ = data.seek(SeekFrom::Start(flash_group.data_offset));
+
+        for chunk in flash_group.chunks {
+            let out_size = chunk.chunk_size as usize * block_size as usize; // bytes
             let chunk_size_sectors = min(
-                sectors_left,
-                channel.fh_config().send_buffer_size / channel.fh_config().storage_sector_size,
-            );
-            let max_download = min(
-                channel.fh_config().send_buffer_size,
-                chunk_size_sectors * channel.fh_config().storage_sector_size,
-            );
-            println!("Downloading part {i}");
-
-            for chunk in split.chunks {
-                data.seek(SeekFrom::Start(chunk.offset as u64))?;
-                let n = channel.write(chunk.header.to_bytes()).expect("Error sending data");
-                if n != chunk_size_sectors * channel.fh_config().storage_sector_size {
-                    bail!("Wrote an unexpected number of bytes ({})", n);
-                }
-            }
-            // let mut sender = fb.download(split.sparse_size() as u32)?;
-
-            // sender.extend_from_slice(&split.header.to_bytes())?;
-            // for chunk in &split.chunks {
-            //     sender.extend_from_slice(&chunk.header.to_bytes())?;
-            //     data.seek(SeekFrom::Start(chunk.offset as u64))?;
-            //     let mut left = chunk.size;
-            //     while left > 0 {
-            //         let buf = sender.get_mut_data(left)?;
-            //         //left -= data.read_exact(buf).context("Failed to read from file")?;
-            //     }
-            // }
-            // sender.finish()?;
-            println!("Flashing Part {i}");
-        }
-
-        while sectors_left > 0 {
-            let chunk_size_sectors = min(
-                sectors_left,
-                channel.fh_config().send_buffer_size / channel.fh_config().storage_sector_size,
+                min(
+                    sectors_left,
+                    channel.fh_config().send_buffer_size / channel.fh_config().storage_sector_size,
+                ),
+                out_size / channel.fh_config().storage_sector_size,
             );
             let mut buf = vec![
                 0u8;
@@ -561,7 +567,16 @@ pub fn firehose_program_storage_sparse<T: Read + Write + QdlChan, Q: Read + Seek
                     chunk_size_sectors * channel.fh_config().storage_sector_size,
                 )
             ];
-            let _ = data.read(&mut buf).unwrap();
+            if chunk.chunk_type == ChunkType::Raw {
+                let _ = data.read(&mut buf).unwrap();
+            } else {
+                let mut fill_value = vec![0u8; 4];
+                let _ = data.read(&mut fill_value);
+
+                for _ in 0..out_size / 4 {
+                    let _ = buf.write(&fill_value[..]);
+                }
+            }
 
             let n = channel.write(&buf).expect("Error sending data");
             if n != chunk_size_sectors * channel.fh_config().storage_sector_size {
@@ -570,15 +585,6 @@ pub fn firehose_program_storage_sparse<T: Read + Write + QdlChan, Q: Read + Seek
 
             sectors_left -= chunk_size_sectors;
             pb.add((chunk_size_sectors * channel.fh_config().storage_sector_size) as u64);
-        }
-
-        // Send a Zero-Length Packet to indicate end of stream
-        if channel.fh_config().backend == QdlBackend::Usb && !channel.fh_config().skip_usb_zlp {
-            let _ = channel.write(&[]).expect("Error sending ZLP");
-        }
-
-        if firehose_read::<T>(channel, firehose_parser_ack_nak)? != FirehoseStatus::Ack {
-            bail!("Failed to complete 'write' op");
         }
     }
 
